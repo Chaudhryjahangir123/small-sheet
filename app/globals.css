@@ -5,6 +5,8 @@
   --line: #d3dbd8;
   --ink: #16212c;
   --ink-faint: #7a8894;
+  --active: #2e7bd6;
+  --sel: #e7f0fb;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -14,6 +16,8 @@
     --line: #2a3640;
     --ink: #e6ecf0;
     --ink-faint: #8b9aa6;
+    --active: #5aa2f0;
+    --sel: #1d3550;
   }
 }
 * { box-sizing: border-box; }
@@ -63,4 +67,26 @@ body {
   overflow: hidden;
   border-right: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
+}
+
+.scroller { user-select: none; }
+.scroller:focus-visible { outline: 2px solid var(--active); outline-offset: -2px; }
+.cell { position: relative; }
+.cell.num { justify-content: flex-end; }
+.cell.selected { background: var(--sel); }
+.cell.active { box-shadow: inset 0 0 0 2px var(--active); background: var(--surface); }
+.cell.editing { overflow: visible; }
+.colHead.hl, .rowHead.hl { background: var(--sel); color: var(--ink); }
+.cellInput {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  padding: 0 8px;
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface);
+  user-select: text;
 }
