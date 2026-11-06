@@ -90,3 +90,63 @@ body {
   background: var(--surface);
   user-select: text;
 }
+
+:root {
+  --computed: #1f5fb0;
+  --alert: #b3382f;
+  --alert-tint: #fae8e7;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --computed: #7db4f2;
+    --alert: #ff8a80;
+    --alert-tint: #3a2224;
+  }
+}
+.sheet { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.formulaBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.addrBox {
+  min-width: 64px;
+  text-align: center;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.fx { color: var(--ink-faint); font-style: italic; font-family: serif; }
+.barInput {
+  flex: 1;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 10px;
+  font: inherit;
+  background: var(--bg);
+  color: var(--ink);
+}
+.barInput:focus { outline: 2px solid var(--active); outline-offset: -1px; }
+.statusBar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-faint);
+  font-size: 12.5px;
+}
+.statusBar b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.statusBar .grow { flex: 1; }
+.cell.num { font-variant-numeric: tabular-nums; }
+.cell.computed { color: var(--computed); }
+.cell.err { color: var(--alert); font-weight: 600; }
+.cell.err:not(.selected) { background: var(--alert-tint); }

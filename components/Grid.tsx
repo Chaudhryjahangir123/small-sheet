@@ -3,15 +3,15 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
-import { colToLabel } from "../lib/address";
+import { addr, colToLabel } from "../lib/address";
+import { COLS, ROWS, SheetModel, formatNumber } from "../lib/sheet";
 
-const ROWS = 10000;
-const COLS = 26;
 const ROW_H = 28;
 const COL_W = 96;
 const HEAD_W = 56;
@@ -20,23 +20,24 @@ const OVERSCAN = 8;
 
 type Pos = { r: number; c: number };
 type Selection = { anchor: Pos; focus: Pos };
-type Editing = { r: number; c: number; draft: string };
+type Editing = { r: number; c: number; draft: string; from: "cell" | "bar" };
 
 const COL_INDEXES = Array.from({ length: COLS }, (_, i) => i);
 const clamp = (n: number, min: number, max: number) =>
   Math.min(max, Math.max(min, n));
-const cellKey = (r: number, c: number) => `${r},${c}`;
 
 export default function Grid() {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dragging = useRef(false);
 
+  // The model holds the data. "version" just makes React redraw after an edit.
+  const [model] = useState(() => new SheetModel());
+  const [version, setVersion] = useState(0);
+  const bump = () => setVersion((v) => v + 1);
+
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(600);
-  // What the user typed, keyed by "row,col". Empty cells are simply absent.
-  const [cells, setCells] = useState<Record<string, string>>({});
-  // The active cell is the anchor. The selected range runs anchor -> focus.
   const [sel, setSel] = useState<Selection>({
     anchor: { r: 0, c: 0 },
     focus: { r: 0, c: 0 },
@@ -53,7 +54,6 @@ export default function Grid() {
     return () => ro.disconnect();
   }, []);
 
-  // Stop dragging when the mouse is released anywhere on the page.
   useEffect(() => {
     const up = () => {
       dragging.current = false;
@@ -62,18 +62,17 @@ export default function Grid() {
     return () => window.removeEventListener("mouseup", up);
   }, []);
 
-  // When editing starts, put the cursor in the input at the end of the text.
-  const isEditing = editing !== null;
+  // When editing starts inside a cell, focus its input with the cursor at the end.
+  const editFrom = editing?.from;
   useEffect(() => {
     const el = inputRef.current;
-    if (isEditing && el) {
+    if (editFrom === "cell" && el) {
       el.focus();
       const n = el.value.length;
       el.setSelectionRange(n, n);
     }
-  }, [isEditing]);
+  }, [editFrom]);
 
-  // Scroll just enough so the given cell is fully visible.
   const ensureVisible = useCallback((r: number, c: number) => {
     const el = scrollerRef.current;
     if (!el) return;
@@ -99,33 +98,28 @@ export default function Grid() {
     ensureVisible(pos.r, pos.c);
   };
 
-  const startEdit = (r: number, c: number, draft: string) => {
-    setEditing({ r, c, draft });
-  };
+  const startEdit = (
+    r: number,
+    c: number,
+    draft: string,
+    from: "cell" | "bar" = "cell"
+  ) => setEditing({ r, c, draft, from });
 
   const commitEdit = (value: string) => {
     if (!editing) return;
-    const k = cellKey(editing.r, editing.c);
-    setCells((prev) => {
-      const next = { ...prev };
-      if (value === "") delete next[k];
-      else next[k] = value;
-      return next;
-    });
+    const changed = model.setRaw(editing.r, editing.c, value);
+    if (changed.length > 0) bump();
     setEditing(null);
   };
 
   const clearSelection = () => {
-    const r1 = Math.min(sel.anchor.r, sel.focus.r);
-    const r2 = Math.max(sel.anchor.r, sel.focus.r);
-    const c1 = Math.min(sel.anchor.c, sel.focus.c);
-    const c2 = Math.max(sel.anchor.c, sel.focus.c);
-    setCells((prev) => {
-      const next = { ...prev };
-      for (let r = r1; r <= r2; r++)
-        for (let c = c1; c <= c2; c++) delete next[cellKey(r, c)];
-      return next;
-    });
+    const changed = model.clearRange(
+      Math.min(sel.anchor.r, sel.focus.r),
+      Math.min(sel.anchor.c, sel.focus.c),
+      Math.max(sel.anchor.r, sel.focus.r),
+      Math.max(sel.anchor.c, sel.focus.c)
+    );
+    if (changed.length > 0) bump();
   };
 
   // ---- keyboard while NOT editing ----
@@ -152,7 +146,7 @@ export default function Grid() {
       case "Enter":
       case "F2":
         e.preventDefault();
-        return startEdit(a.r, a.c, cells[cellKey(a.r, a.c)] ?? "");
+        return startEdit(a.r, a.c, model.getRaw(a.r, a.c));
       case "Delete":
       case "Backspace":
         e.preventDefault();
@@ -160,15 +154,14 @@ export default function Grid() {
       case "Escape":
         return setSel({ anchor: a, focus: a });
     }
-    // Typing a normal character starts editing and replaces what was there.
     if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       startEdit(a.r, a.c, e.key);
     }
   };
 
-  // ---- keyboard while editing (inside the input) ----
-  const onInputKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+  // ---- keyboard while editing (cell input and formula bar share this) ----
+  const onEditKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (!editing) return;
     if (e.key === "Enter") {
       e.preventDefault();
@@ -193,10 +186,11 @@ export default function Grid() {
     if (!t) return null;
     return { r: Number(t.dataset.r), c: Number(t.dataset.c) };
   };
+  const isInput = (e: MouseEvent) =>
+    (e.target as HTMLElement).tagName === "INPUT";
 
   const onMouseDown = (e: MouseEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    if ((e.target as HTMLElement).tagName === "INPUT") return;
+    if (e.button !== 0 || isInput(e)) return;
     const p = cellFromEvent(e);
     if (!p) return;
     e.preventDefault();
@@ -220,8 +214,9 @@ export default function Grid() {
   };
 
   const onDoubleClick = (e: MouseEvent<HTMLDivElement>) => {
+    if (isInput(e)) return;
     const p = cellFromEvent(e);
-    if (p) startEdit(p.r, p.c, cells[cellKey(p.r, p.c)] ?? "");
+    if (p) startEdit(p.r, p.c, model.getRaw(p.r, p.c));
   };
 
   // ---- what to draw ----
@@ -233,101 +228,160 @@ export default function Grid() {
   const rows: number[] = [];
   for (let r = first; r <= last; r++) rows.push(r);
 
+  const a = sel.anchor;
   const top = Math.min(sel.anchor.r, sel.focus.r);
   const bottom = Math.max(sel.anchor.r, sel.focus.r);
   const left = Math.min(sel.anchor.c, sel.focus.c);
   const right = Math.max(sel.anchor.c, sel.focus.c);
 
+  const stats = useMemo(() => {
+    void version; // recompute after every edit
+    return model.stats(top, left, bottom, right);
+  }, [model, version, top, bottom, left, right]);
+
+  const rangeLabel =
+    top === bottom && left === right
+      ? addr(left, top)
+      : `${addr(left, top)}:${addr(right, bottom)}`;
+
+  const barValue = editing ? editing.draft : model.getRaw(a.r, a.c);
+
   return (
-    <div
-      ref={scrollerRef}
-      className="scroller"
-      tabIndex={0}
-      onKeyDown={onKeyDown}
-      onMouseDown={onMouseDown}
-      onMouseMove={onMouseMove}
-      onDoubleClick={onDoubleClick}
-      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
-      role="grid"
-      aria-label="Spreadsheet"
-      aria-rowcount={ROWS + 1}
-      aria-colcount={COLS}
-    >
-      <div style={{ width: HEAD_W + COLS * COL_W }}>
-        <div className="headerRow" style={{ height: HEAD_H }}>
-          <div className="corner" style={{ width: HEAD_W }} />
-          {COL_INDEXES.map((c) => (
-            <div
-              key={c}
-              className={c >= left && c <= right ? "colHead hl" : "colHead"}
-              style={{ width: COL_W }}
-            >
-              {colToLabel(c)}
-            </div>
-          ))}
+    <div className="sheet">
+      <div className="formulaBar">
+        <div className="addrBox" aria-label="Active cell">
+          {addr(a.c, a.r)}
         </div>
+        <span className="fx" aria-hidden="true">
+          fx
+        </span>
+        <input
+          className="barInput"
+          aria-label="Formula bar"
+          value={barValue}
+          onFocus={() => {
+            if (!editing)
+              startEdit(a.r, a.c, model.getRaw(a.r, a.c), "bar");
+            else if (editing.from !== "bar")
+              setEditing({ ...editing, from: "bar" });
+          }}
+          onChange={(e) =>
+            editing
+              ? setEditing({ ...editing, draft: e.target.value })
+              : startEdit(a.r, a.c, e.target.value, "bar")
+          }
+          onKeyDown={onEditKeyDown}
+        />
+      </div>
 
-        <div style={{ height: ROWS * ROW_H, position: "relative" }}>
-          {rows.map((r) => (
-            <div
-              key={r}
-              className="row"
-              style={{ top: r * ROW_H, height: ROW_H }}
-              role="row"
-              aria-rowindex={r + 2}
-            >
+      <div
+        ref={scrollerRef}
+        className="scroller"
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onDoubleClick={onDoubleClick}
+        onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+        role="grid"
+        aria-label="Spreadsheet"
+        aria-rowcount={ROWS + 1}
+        aria-colcount={COLS}
+      >
+        <div style={{ width: HEAD_W + COLS * COL_W }}>
+          <div className="headerRow" style={{ height: HEAD_H }}>
+            <div className="corner" style={{ width: HEAD_W }} />
+            {COL_INDEXES.map((c) => (
               <div
-                className={r >= top && r <= bottom ? "rowHead hl" : "rowHead"}
-                style={{ width: HEAD_W }}
+                key={c}
+                className={c >= left && c <= right ? "colHead hl" : "colHead"}
+                style={{ width: COL_W }}
               >
-                {r + 1}
+                {colToLabel(c)}
               </div>
-              {COL_INDEXES.map((c) => {
-                const raw = cells[cellKey(r, c)] ?? "";
-                const inRange = r >= top && r <= bottom && c >= left && c <= right;
-                const isActive = r === sel.anchor.r && c === sel.anchor.c;
-                const isEditingHere =
-                  editing !== null && editing.r === r && editing.c === c;
-                const isNumber = raw !== "" && !isNaN(Number(raw));
+            ))}
+          </div>
 
-                let cls = "cell";
-                if (isNumber) cls += " num";
-                if (inRange) cls += " selected";
-                if (isActive) cls += " active";
-                if (isEditingHere) cls += " editing";
+          <div style={{ height: ROWS * ROW_H, position: "relative" }}>
+            {rows.map((r) => (
+              <div
+                key={r}
+                className="row"
+                style={{ top: r * ROW_H, height: ROW_H }}
+                role="row"
+                aria-rowindex={r + 2}
+              >
+                <div
+                  className={r >= top && r <= bottom ? "rowHead hl" : "rowHead"}
+                  style={{ width: HEAD_W }}
+                >
+                  {r + 1}
+                </div>
+                {COL_INDEXES.map((c) => {
+                  const info = model.cellInfo(r, c);
+                  const inRange =
+                    r >= top && r <= bottom && c >= left && c <= right;
+                  const isActive = r === a.r && c === a.c;
+                  const isEditingHere =
+                    editing !== null && editing.r === r && editing.c === c;
 
-                return (
-                  <div
-                    key={c}
-                    id={`cell-${r}-${c}`}
-                    className={cls}
-                    style={{ width: COL_W }}
-                    role="gridcell"
-                    aria-selected={inRange}
-                    aria-colindex={c + 1}
-                    data-r={r}
-                    data-c={c}
-                  >
-                    {isEditingHere ? (
-                      <input
-                        ref={inputRef}
-                        className="cellInput"
-                        value={editing.draft}
-                        onChange={(e) =>
-                          setEditing({ ...editing, draft: e.target.value })
-                        }
-                        onKeyDown={onInputKeyDown}
-                        aria-label={`Edit ${colToLabel(c)}${r + 1}`}
-                      />
-                    ) : (
-                      raw
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
+                  let cls = "cell";
+                  if (info.kind === "number") cls += " num";
+                  if (info.kind === "error") cls += " err";
+                  else if (info.formula) cls += " computed";
+                  if (inRange) cls += " selected";
+                  if (isActive) cls += " active";
+                  if (isEditingHere) cls += " editing";
+
+                  return (
+                    <div
+                      key={c}
+                      id={`cell-${r}-${c}`}
+                      className={cls}
+                      style={{ width: COL_W }}
+                      role="gridcell"
+                      aria-selected={inRange}
+                      aria-colindex={c + 1}
+                      data-r={r}
+                      data-c={c}
+                    >
+                      {isEditingHere && editing.from === "cell" ? (
+                        <input
+                          ref={inputRef}
+                          className="cellInput"
+                          value={editing.draft}
+                          onChange={(e) =>
+                            setEditing({ ...editing, draft: e.target.value })
+                          }
+                          onKeyDown={onEditKeyDown}
+                          aria-label={`Edit ${colToLabel(c)}${r + 1}`}
+                        />
+                      ) : isEditingHere ? (
+                        editing.draft
+                      ) : (
+                        info.text
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
         </div>
+      </div>
+
+      <div className="statusBar">
+        <span>{rangeLabel}</span>
+        <span className="grow" />
+        <span>
+          Sum <b>{formatNumber(stats.sum)}</b>
+        </span>
+        <span>
+          Average <b>{stats.avg === null ? "-" : formatNumber(stats.avg)}</b>
+        </span>
+        <span>
+          Count <b>{stats.count}</b>
+        </span>
       </div>
     </div>
   );
