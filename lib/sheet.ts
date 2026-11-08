@@ -4,6 +4,7 @@ export const COLS = 26;
 export type CellErr = { err: string };
 export type Value = number | string | CellErr;
 export type Change = { r: number; c: number; before: string; after: string };
+export type Entry = [number, number, string];
 export type CellInfo = {
   text: string;
   kind: "empty" | "text" | "number" | "error";
@@ -33,7 +34,9 @@ const NUMBER_RE = /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i;
 const EMPTY: CellInfo = { text: "", kind: "empty", formula: false };
 
 export function formatNumber(n: number): string {
-  return String(parseFloat(n.toPrecision(12)));
+  const s = String(parseFloat(n.toPrecision(12)));
+  if (s.length <= 11 || s.includes("e")) return s;
+  return String(Math.round(n * 1e4) / 1e4);
 }
 
 function labelToCol(label: string): number {
@@ -290,7 +293,24 @@ export class SheetModel {
     }
     return { sum, count, nums, avg: nums > 0 ? sum / nums : null };
   }
+  get size(): number {
+    return this.raws.size;
+  }
 
+  entries(): Entry[] {
+    const out: Entry[] = [];
+    for (const [k, raw] of this.raws)
+      out.push([Math.floor(k / COLS), k % COLS, raw]);
+    return out;
+  }
+
+  load(entries: readonly Entry[]) {
+    for (const [r, c, raw] of entries) {
+      if (r >= 0 && r < ROWS && c >= 0 && c < COLS && raw !== "")
+        this.store(r * COLS + c, raw);
+    }
+    this.values.clear();
+  }
   // ---------- internals ----------
   private store(k: number, raw: string) {
     this.unindex(k);
