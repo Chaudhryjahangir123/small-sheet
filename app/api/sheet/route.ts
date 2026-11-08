@@ -2,8 +2,6 @@ import { NextResponse } from "next/server";
 import { readStore, writeStore } from "../../../lib/store";
 import { COLS, ROWS, type Entry } from "../../../lib/sheet";
 
-export const dynamic = "force-dynamic";
-
 const idOf = (request: Request) =>
   new URL(request.url).searchParams.get("id") ?? "";
 

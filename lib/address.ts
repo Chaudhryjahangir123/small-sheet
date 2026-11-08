@@ -13,3 +13,12 @@ export function colToLabel(col: number): string {
 export function addr(col: number, row: number): string {
   return `${colToLabel(col)}${row + 1}`;
 }
+
+// "B7" -> { r: 6, c: 1 }. Returns null if it is not an address.
+export function parseAddr(s: string): { r: number; c: number } | null {
+  const m = /^([A-Za-z]{1,3})(\d{1,6})$/.exec(s.trim());
+  if (!m) return null;
+  let c = 0;
+  for (const ch of m[1].toUpperCase()) c = c * 26 + (ch.charCodeAt(0) - 64);
+  return { r: Number(m[2]) - 1, c: c - 1 };
+}

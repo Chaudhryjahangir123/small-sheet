@@ -1,9 +1,9 @@
-import Grid from "../components/Grid";
+import Workbook from "../components/Workbook";
 
 export default function Home() {
   return (
     <main className="app">
-      <Grid />
+      <Workbook />
     </main>
   );
 }

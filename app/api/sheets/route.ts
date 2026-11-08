@@ -1,9 +1,8 @@
-import { NextResponse } from "next/server";
+import { NextResponse, connection } from "next/server";
 import { readStore, writeStore } from "../../../lib/store";
 
-export const dynamic = "force-dynamic";
-
 export async function GET() {
+  await connection(); // always run on request, never cache
   const store = await readStore();
   return NextResponse.json(store.sheets.map(({ id, name }) => ({ id, name })));
 }

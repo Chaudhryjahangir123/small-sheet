@@ -6,43 +6,82 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent,
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
 import { addr, colToLabel } from "../lib/address";
-import { COLS, ROWS, SheetModel, formatNumber } from "../lib/sheet";
+import {
+  COLS,
+  ROWS,
+  formatNumber,
+  type Change,
+  type SheetModel,
+} from "../lib/sheet";
 
 const ROW_H = 28;
-const COL_W = 96;
+const COL_W = 112;
 const HEAD_W = 56;
 const HEAD_H = 28;
 const OVERSCAN = 8;
+
+// Limits for pasted data. Anything bigger is refused with a message.
+const MAX_PASTE_CHARS = 20_000_000;
+const MAX_PASTE_CELLS = 200_000;
+const MAX_CELL_LEN = 5000;
 
 type Pos = { r: number; c: number };
 type Selection = { anchor: Pos; focus: Pos };
 type Editing = { r: number; c: number; draft: string; from: "cell" | "bar" };
 
+export type History = { undo: Change[][]; redo: Change[][] };
+
+type Props = {
+  model: SheetModel;
+  hist: History;
+  initialCell?: Pos;
+  onChange?: () => void;
+  onCellChange?: (p: Pos) => void;
+};
+
 const COL_INDEXES = Array.from({ length: COLS }, (_, i) => i);
 const clamp = (n: number, min: number, max: number) =>
   Math.min(max, Math.max(min, n));
 
-export default function Grid() {
+// Turn clipboard text (tabs between cells, newlines between rows) into rows.
+function parseClipboard(text: string): string[][] {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines.map((line) =>
+    line.split("\t").map((v) => v.slice(0, MAX_CELL_LEN))
+  );
+}
+
+export default function Grid({
+  model,
+  hist,
+  initialCell,
+  onChange,
+  onCellChange,
+}: Props) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dragging = useRef(false);
 
-  // The model holds the data. "version" just makes React redraw after an edit.
-  const [model] = useState(() => new SheetModel());
   const [version, setVersion] = useState(0);
-  const bump = () => setVersion((v) => v + 1);
+  const bump = () => {
+    setVersion((v) => v + 1);
+    onChange?.();
+  };
 
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(600);
-  const [sel, setSel] = useState<Selection>({
-    anchor: { r: 0, c: 0 },
-    focus: { r: 0, c: 0 },
+  const [sel, setSel] = useState<Selection>(() => {
+    const p = initialCell ?? { r: 0, c: 0 };
+    return { anchor: p, focus: p };
   });
   const [editing, setEditing] = useState<Editing | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -62,7 +101,12 @@ export default function Grid() {
     return () => window.removeEventListener("mouseup", up);
   }, []);
 
-  // When editing starts inside a cell, focus its input with the cursor at the end.
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
   const editFrom = editing?.from;
   useEffect(() => {
     const el = inputRef.current;
@@ -90,6 +134,20 @@ export default function Grid() {
       el.scrollLeft = right - visibleW;
   }, []);
 
+  // Scroll to the starting cell once, when the grid first appears.
+  useEffect(() => {
+    if (initialCell) ensureVisible(initialCell.r, initialCell.c);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Tell the page which cell is active, so the URL can say so.
+  const activeR = sel.anchor.r;
+  const activeC = sel.anchor.c;
+  useEffect(() => {
+    onCellChange?.({ r: activeR, c: activeC });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeR, activeC]);
+
   const moveTo = (r: number, c: number, extend: boolean) => {
     const pos = { r: clamp(r, 0, ROWS - 1), c: clamp(c, 0, COLS - 1) };
     setSel((s) =>
@@ -105,26 +163,151 @@ export default function Grid() {
     from: "cell" | "bar" = "cell"
   ) => setEditing({ r, c, draft, from });
 
+  // Every real change goes through here, so undo sees it as one step.
+  const record = (changes: Change[]) => {
+    if (changes.length === 0) return;
+    hist.undo.push(changes);
+    hist.redo.length = 0; // a new edit makes the old redo steps invalid
+    bump();
+  };
+
   const commitEdit = (value: string) => {
     if (!editing) return;
-    const changed = model.setRaw(editing.r, editing.c, value);
-    if (changed.length > 0) bump();
+    record(model.setRaw(editing.r, editing.c, value));
     setEditing(null);
   };
 
+  const bounds = () => ({
+    top: Math.min(sel.anchor.r, sel.focus.r),
+    bottom: Math.max(sel.anchor.r, sel.focus.r),
+    left: Math.min(sel.anchor.c, sel.focus.c),
+    right: Math.max(sel.anchor.c, sel.focus.c),
+  });
+
   const clearSelection = () => {
-    const changed = model.clearRange(
-      Math.min(sel.anchor.r, sel.focus.r),
-      Math.min(sel.anchor.c, sel.focus.c),
-      Math.max(sel.anchor.r, sel.focus.r),
-      Math.max(sel.anchor.c, sel.focus.c)
-    );
-    if (changed.length > 0) bump();
+    const b = bounds();
+    record(model.clearRange(b.top, b.left, b.bottom, b.right));
+  };
+
+  // ---- undo and redo ----
+  const jumpTo = (batch: Change[]) => {
+    let r1 = ROWS;
+    let r2 = 0;
+    let c1 = COLS;
+    let c2 = 0;
+    for (const ch of batch) {
+      r1 = Math.min(r1, ch.r);
+      r2 = Math.max(r2, ch.r);
+      c1 = Math.min(c1, ch.c);
+      c2 = Math.max(c2, ch.c);
+    }
+    setSel({ anchor: { r: r1, c: c1 }, focus: { r: r2, c: c2 } });
+    ensureVisible(r1, c1);
+  };
+
+  const undo = () => {
+    const batch = hist.undo.pop();
+    if (!batch) return;
+    model.apply(batch.map((ch) => ({ ...ch, after: ch.before })));
+    hist.redo.push(batch);
+    jumpTo(batch);
+    bump();
+  };
+
+  const redo = () => {
+    const batch = hist.redo.pop();
+    if (!batch) return;
+    model.apply(batch);
+    hist.undo.push(batch);
+    jumpTo(batch);
+    bump();
+  };
+
+  // ---- copy, cut, paste ----
+  const selectionText = () => {
+    const b = bounds();
+    const lines: string[] = [];
+    for (let r = b.top; r <= b.bottom; r++) {
+      const row: string[] = [];
+      for (let c = b.left; c <= b.right; c++) row.push(model.getRaw(r, c));
+      lines.push(row.join("\t"));
+    }
+    return lines.join("\n");
+  };
+
+  const onCopy = (e: ClipboardEvent<HTMLDivElement>) => {
+    if (editing) return; // let the text box copy normally
+    e.preventDefault();
+    e.clipboardData.setData("text/plain", selectionText());
+  };
+
+  const onCut = (e: ClipboardEvent<HTMLDivElement>) => {
+    if (editing) return;
+    e.preventDefault();
+    e.clipboardData.setData("text/plain", selectionText());
+    clearSelection();
+  };
+
+  const onPaste = (e: ClipboardEvent<HTMLDivElement>) => {
+    if (editing) return;
+    e.preventDefault();
+    // We only ever read plain text. HTML from a web page never becomes markup.
+    const text = e.clipboardData.getData("text/plain");
+    if (!text) return;
+    if (text.length > MAX_PASTE_CHARS) {
+      setNotice("That paste is too large. Nothing was pasted.");
+      return;
+    }
+    const block = parseClipboard(text);
+    let width = 0;
+    for (const line of block) width = Math.max(width, line.length);
+    if (block.length * width > MAX_PASTE_CELLS) {
+      setNotice(
+        `That paste is too large (limit ${MAX_PASTE_CELLS.toLocaleString()} cells). Nothing was pasted.`
+      );
+      return;
+    }
+    const a = sel.anchor;
+    const changes: Change[] = [];
+    let clipped = false;
+    for (let i = 0; i < block.length; i++) {
+      for (let j = 0; j < block[i].length; j++) {
+        const r = a.r + i;
+        const c = a.c + j;
+        if (r >= ROWS || c >= COLS) {
+          clipped = true;
+          continue;
+        }
+        changes.push({ r, c, before: "", after: block[i][j] });
+      }
+    }
+    record(model.apply(changes));
+    setSel({
+      anchor: a,
+      focus: {
+        r: Math.min(ROWS - 1, a.r + block.length - 1),
+        c: Math.min(COLS - 1, a.c + width - 1),
+      },
+    });
+    if (clipped)
+      setNotice("Some pasted cells fell outside the sheet and were skipped.");
   };
 
   // ---- keyboard while NOT editing ----
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (editing) return;
+    if (e.ctrlKey || e.metaKey) {
+      const k = e.key.toLowerCase();
+      if (k === "z") {
+        e.preventDefault();
+        return e.shiftKey ? redo() : undo();
+      }
+      if (k === "y") {
+        e.preventDefault();
+        return redo();
+      }
+      return; // let copy, cut and paste through
+    }
     const base = e.shiftKey ? sel.focus : sel.anchor;
     const a = sel.anchor;
     switch (e.key) {
@@ -154,7 +337,7 @@ export default function Grid() {
       case "Escape":
         return setSel({ anchor: a, focus: a });
     }
-    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (e.key.length === 1 && !e.altKey) {
       e.preventDefault();
       startEdit(a.r, a.c, e.key);
     }
@@ -229,13 +412,10 @@ export default function Grid() {
   for (let r = first; r <= last; r++) rows.push(r);
 
   const a = sel.anchor;
-  const top = Math.min(sel.anchor.r, sel.focus.r);
-  const bottom = Math.max(sel.anchor.r, sel.focus.r);
-  const left = Math.min(sel.anchor.c, sel.focus.c);
-  const right = Math.max(sel.anchor.c, sel.focus.c);
+  const { top, bottom, left, right } = bounds();
 
   const stats = useMemo(() => {
-    void version; // recompute after every edit
+    void version;
     return model.stats(top, left, bottom, right);
   }, [model, version, top, bottom, left, right]);
 
@@ -249,6 +429,32 @@ export default function Grid() {
   return (
     <div className="sheet">
       <div className="formulaBar">
+        <div className="tools">
+          <button
+            className="tbtn"
+            aria-label="Undo"
+            title="Undo (Ctrl+Z)"
+            disabled={hist.undo.length === 0}
+            onClick={() => {
+              undo();
+              scrollerRef.current?.focus();
+            }}
+          >
+            ↶
+          </button>
+          <button
+            className="tbtn"
+            aria-label="Redo"
+            title="Redo (Ctrl+Y)"
+            disabled={hist.redo.length === 0}
+            onClick={() => {
+              redo();
+              scrollerRef.current?.focus();
+            }}
+          >
+            ↷
+          </button>
+        </div>
         <div className="addrBox" aria-label="Active cell">
           {addr(a.c, a.r)}
         </div>
@@ -282,6 +488,9 @@ export default function Grid() {
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
         onDoubleClick={onDoubleClick}
+        onCopy={onCopy}
+        onCut={onCut}
+        onPaste={onPaste}
         onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
         role="grid"
         aria-label="Spreadsheet"
@@ -370,8 +579,17 @@ export default function Grid() {
         </div>
       </div>
 
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {`${addr(a.c, a.r)}, ${model.cellInfo(a.r, a.c).text || "empty"}`}
+      </div>
+
       <div className="statusBar">
         <span>{rangeLabel}</span>
+        {notice && (
+          <span className="notice" role="status">
+            {notice}
+          </span>
+        )}
         <span className="grow" />
         <span>
           Sum <b>{formatNumber(stats.sum)}</b>
